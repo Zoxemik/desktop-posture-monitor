@@ -1,0 +1,114 @@
+{
+  "sessions": [
+    {
+      "started_at": "2026-04-05 03:36:59",
+      "finished_at": "2026-04-05 03:38:34",
+      "alert_count": 0,
+      "bad_posture_total_seconds": 37.17,
+      "was_calibrated": true,
+      "baseline": {
+        "head_forward_abs": 0.06437308713793755,
+        "torso_angle_deg": 12.845157943865855,
+        "neck_gap": 0.16844682395458221,
+        "shoulder_width": 0.30019714036731004
+      }
+    },
+    {
+      "started_at": "2026-04-05 12:33:06",
+      "finished_at": "2026-04-05 12:38:08",
+      "alert_count": 0,
+      "bad_posture_total_seconds": 40.08,
+      "was_calibrated": true,
+      "baseline": {
+        "head_forward_abs": 0.04526187852025032,
+        "torso_angle_deg": 12.946913670986234,
+        "neck_gap": 0.16873057186603546,
+        "shoulder_width": 0.303187517596361
+      }
+    },
+    {
+      "started_at": "2026-04-06 03:34:49",
+      "finished_at": "2026-04-06 03:35:12",
+      "alert_count": 0,
+      "bad_posture_total_seconds": 0.0,
+      "was_calibrated": false,
+      "baseline": null
+    },
+    {
+      "started_at": "2026-04-06 03:36:27",
+      "finished_at": "2026-04-06 03:38:28",
+      "alert_count": 0,
+      "bad_posture_total_seconds": 17.3,
+      "was_calibrated": true,
+      "baseline": {
+        "head_forward_abs": 0.06470289942808449,
+        "torso_angle_deg": 10.077030043328621,
+        "neck_gap": 0.1801542192697525,
+        "shoulder_width": 0.2706171858898325
+      }
+    },
+    {
+      "started_at": "2026-04-06 14:08:45",
+      "finished_at": "2026-04-06 14:20:43",
+      "posture_alert_count": 0,
+      "stillness_alert_count": 0,
+      "total_alert_count": 0,
+      "reposition_count": 46,
+      "bad_posture_total_seconds": 58.09,
+      "static_load_total_seconds": 0.0,
+      "was_calibrated": true,
+      "baseline": {
+        "head_forward_abs": 0.059596434235572815,
+        "torso_angle_deg": 12.376901508910162,
+        "neck_gap": 0.17053715884685516,
+        "shoulder_width": 0.28085499105057593,
+        "ear_width": 0.09334166820763284,
+        "shoulder_tilt_deg": 3.1120603118489516,
+        "head_tilt_deg": 5.072833449471641,
+        "head_side_shift": 0.006832543760538101
+      }
+    },
+    {
+      "started_at": "2026-04-06 14:38:06",
+      "finished_at": "2026-04-06 14:40:10",
+      "posture_alert_count": 0,
+      "stillness_alert_count": 0,
+      "total_alert_count": 0,
+      "reposition_count": 6,
+      "bad_posture_total_seconds": 10.3,
+      "static_load_total_seconds": 0.0,
+      "was_calibrated": true,
+      "baseline": {
+        "head_forward_abs": 0.06480036675930023,
+        "torso_angle_deg": 12.57170328027753,
+        "neck_gap": 0.16229693591594696,
+        "shoulder_width": 0.2847833533083078,
+        "ear_width": 0.1022922112796945,
+        "shoulder_tilt_deg": 5.399601656275489,
+        "head_tilt_deg": 4.7201472205423745,
+        "head_side_shift": 0.010457810014486313
+      }
+    },
+    {
+      "started_at": "2026-04-06 15:00:39",
+      "finished_at": "2026-04-06 15:03:02",
+      "posture_alert_count": 1,
+      "stillness_alert_count": 3,
+      "total_alert_count": 4,
+      "reposition_count": 4,
+      "bad_posture_total_seconds": 33.72,
+      "static_load_total_seconds": 0.0,
+      "was_calibrated": true,
+      "baseline": {
+        "head_forward_abs": 0.04986735247075558,
+        "torso_angle_deg": 11.27105496457125,
+        "neck_gap": 0.16909806430339813,
+        "shoulder_width": 0.27986805261669456,
+        "ear_width": 0.08717346327188125,
+        "shoulder_tilt_deg": 7.221703523537298,
+        "head_tilt_deg": 2.074404353394981,
+        "head_side_shift": 0.0032680127769708633
+      }
+    }
+  ]
+}
