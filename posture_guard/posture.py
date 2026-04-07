@@ -163,11 +163,7 @@ def get_angle_from_horizontal(delta_y: float, delta_x: float) -> float:
     return math.degrees(math.atan2(abs(delta_y), abs(delta_x) + 1e-6))
 
 
-def smooth_landmarks(
-    previous_landmarks,
-    current_landmarks,
-    alpha: float,
-):
+def smooth_landmarks(previous_landmarks, current_landmarks, alpha: float):
     """
     Apply EMA smoothing to landmarks.
 
@@ -212,8 +208,8 @@ def compute_metrics(normalized_landmarks, world_landmarks, config: AppConfig) ->
     """
     Compute the posture metrics that drive ergonomic evaluation.
 
-    The point is not to force one perfect pose.
-    The point is to keep the user inside a neutral calibrated range
+    The goal is not to force one perfect pose.
+    The goal is to keep the user inside a neutral calibrated range
     and detect meaningful drift or static overload.
     """
     if get_average_visibility(normalized_landmarks, IMPORTANT_LANDMARKS) < config.min_visibility:

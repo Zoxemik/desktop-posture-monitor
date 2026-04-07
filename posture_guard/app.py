@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import os
+
+# Reduce native library log noise as much as possible before importing runtime dependencies.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("ABSL_LOG_LEVEL", "2")
+
 import queue
 import signal
 import sys
@@ -14,11 +20,8 @@ import cv2
 from mediapipe.tasks.python import vision
 
 from config import AppConfig
-from config import ensure_parent_directory
 from config import load_app_config
-from config import read_json_file
 from config import save_app_config
-from config import write_json_file
 from posture import build_baseline
 from posture import compute_metrics
 from posture import compute_movement_score
@@ -31,115 +34,135 @@ from posture import smooth_landmarks
 from posture import smooth_metrics
 
 
-APP_DATA_FOLDER_NAME = "PostureGuard"
-
-
 # ============================================================
-# Storage helpers
+# Path helpers
 # ============================================================
 
-def get_project_root() -> Path:
+DATA_DIR_NAME = "data"
+CONFIG_FILE_NAME = "config.json"
+
+
+def get_runtime_directory() -> Path:
     """
-    Return the project root in source mode.
-    When frozen with PyInstaller, resources are read from _MEIPASS.
+    Return the base directory used by the application.
+
+    In source mode this is the directory containing app.py.
+    In frozen mode this is the directory containing the executable.
     """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+
     return Path(__file__).resolve().parent.parent
 
 
 def get_resource_path(relative_path: str) -> Path:
+    """
+    Resolve a resource path for both source mode and PyInstaller mode.
+    """
     relative = Path(relative_path)
 
     if hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / relative
 
-    return get_project_root() / relative
+    return get_runtime_directory() / relative
 
 
-def get_writable_base_directory() -> Path:
+def get_data_directory() -> Path:
     """
-    Return a user-writable application directory.
+    Return the directory used for mutable runtime files.
 
-    On Windows, LOCALAPPDATA is preferred.
-    On other systems, fallback to a hidden folder in the home directory.
+    The data directory is stored one level above the application directory,
+    exactly as requested.
     """
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / APP_DATA_FOLDER_NAME
-
-    return Path.home() / f".{APP_DATA_FOLDER_NAME.lower()}"
+    data_dir = get_runtime_directory().parent / DATA_DIR_NAME
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
 
-def get_writable_data_path(relative_path: str) -> Path:
-    return get_writable_base_directory() / Path(relative_path)
-
-
-def load_baseline(file_path: Path) -> Optional[dict[str, float]]:
-    data = read_json_file(file_path, None)
-    if not isinstance(data, dict):
-        return None
-
-    try:
-        return {str(key): float(value) for key, value in data.items()}
-    except Exception:
-        return None
-
-
-def save_baseline(file_path: Path, baseline: Optional[dict[str, float]]) -> None:
-    if baseline is None:
-        if file_path.exists():
-            try:
-                file_path.unlink()
-            except Exception:
-                pass
-        return
-
-    write_json_file(file_path, baseline)
-
-
-def save_stats(stats_file: Path, session_summary: dict) -> None:
+def get_config_file_path() -> Path:
     """
-    Append one finished session to the local JSON stats file.
-    If the file is corrupted, recreate a clean structure.
+    Store config in ../data/config.json relative to the app directory.
     """
-    ensure_parent_directory(stats_file)
-
-    data = read_json_file(stats_file, {"sessions": []})
-    if not isinstance(data, dict):
-        data = {"sessions": []}
-
-    sessions = data.setdefault("sessions", [])
-    if not isinstance(sessions, list):
-        data["sessions"] = []
-        sessions = data["sessions"]
-
-    sessions.append(session_summary)
-    write_json_file(stats_file, data)
+    return get_data_directory() / CONFIG_FILE_NAME
 
 
 # ============================================================
 # Camera helpers
 # ============================================================
 
-def open_camera(camera_index: int, frame_width: int, frame_height: int) -> cv2.VideoCapture:
-    """
-    Open the camera using a backend that works well on the current platform.
-    DirectShow is often more reliable for built-in laptop webcams on Windows.
-    """
+@dataclass(frozen=True)
+class CameraOpenResult:
+    capture: cv2.VideoCapture
+    camera_index: int
+    backend_name: str
+
+
+def _get_camera_backend_candidates() -> list[tuple[str, int]]:
     if sys.platform.startswith("win"):
-        capture = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    else:
-        capture = cv2.VideoCapture(camera_index)
+        candidates = [("CAP_DSHOW", cv2.CAP_DSHOW)]
 
-    if not capture.isOpened() and camera_index == 0:
-        capture.release()
-        capture = cv2.VideoCapture(camera_index)
+        # CAP_MSMF is not always available in every OpenCV build.
+        cap_msmf = getattr(cv2, "CAP_MSMF", None)
+        if isinstance(cap_msmf, int):
+            candidates.append(("CAP_MSMF", cap_msmf))
 
-    if capture.isOpened():
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        candidates.append(("CAP_ANY", cv2.CAP_ANY))
+        return candidates
 
-    return capture
+    return [("CAP_ANY", cv2.CAP_ANY)]
+
+
+def _get_camera_index_candidates(preferred_index: int) -> list[int]:
+    indices = [preferred_index]
+    for fallback_index in range(3):
+        if fallback_index not in indices:
+            indices.append(fallback_index)
+    return indices
+
+
+def open_camera(camera_index: int, frame_width: int, frame_height: int) -> CameraOpenResult:
+    """
+    Open a working camera with several backend and index fallbacks.
+
+    This is intentionally defensive because laptop webcams can behave differently
+    across OpenCV builds and Windows backends.
+    """
+    last_error = "unknown error"
+
+    for candidate_index in _get_camera_index_candidates(camera_index):
+        for backend_name, backend_id in _get_camera_backend_candidates():
+            capture = cv2.VideoCapture(candidate_index, backend_id)
+
+            if not capture.isOpened():
+                capture.release()
+                continue
+
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            # Try to grab a frame immediately to verify that the camera really works.
+            read_ok = False
+            for _ in range(8):
+                read_ok, _ = capture.read()
+                if read_ok:
+                    break
+                time.sleep(0.03)
+
+            if read_ok:
+                return CameraOpenResult(
+                    capture=capture,
+                    camera_index=candidate_index,
+                    backend_name=backend_name,
+                )
+
+            last_error = f"Camera opened but did not return frames (index={candidate_index}, backend={backend_name})"
+            capture.release()
+
+    raise RuntimeError(
+        "Could not open a working camera. "
+        f"Last attempt failed with: {last_error}"
+    )
 
 
 def safe_release_camera(capture: Optional[cv2.VideoCapture]) -> None:
@@ -160,7 +183,6 @@ def safe_release_camera(capture: Optional[cv2.VideoCapture]) -> None:
 class AlertPayload:
     title: str
     message: str
-    color: str = "#ff3b30"
 
 
 def set_windows_app_user_model_id(app_id: str) -> None:
@@ -172,6 +194,7 @@ def set_windows_app_user_model_id(app_id: str) -> None:
 
     try:
         import ctypes
+
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except Exception:
         pass
@@ -180,14 +203,11 @@ def set_windows_app_user_model_id(app_id: str) -> None:
 def play_system_notification_sound() -> None:
     """
     Play only the operating system notification sound.
-
-    This intentionally avoids any custom/generated alert beep.
-    On Windows it uses the standard system sound.
-    On other platforms it falls back to the terminal bell.
     """
     try:
         if sys.platform.startswith("win"):
             import winsound
+
             winsound.MessageBeep(winsound.MB_ICONASTERISK)
         else:
             print("\a", end="", flush=True)
@@ -195,169 +215,12 @@ def play_system_notification_sound() -> None:
         pass
 
 
-class CornerOverlay:
-    """
-    A tiny always-on-top square shown in the bottom-left corner of the screen.
-
-    It runs in its own UI thread so the monitoring loop stays responsive.
-    """
-
-    def __init__(self, size_px: int, margin_px: int, alpha: float) -> None:
-        self._size_px = max(8, int(size_px))
-        self._margin_px = max(0, int(margin_px))
-        self._alpha = max(0.2, min(1.0, float(alpha)))
-        self._command_queue: queue.Queue[tuple[str, Optional[str], Optional[float]]] = queue.Queue()
-        self._ready_event = threading.Event()
-        self._thread = threading.Thread(target=self._run_ui, name="CornerOverlayUI", daemon=True)
-        self._thread.start()
-        self._ready_event.wait(timeout=2.0)
-
-    def flash(self, color: str, duration_seconds: float) -> None:
-        self._command_queue.put(("flash", color, max(0.5, float(duration_seconds))))
-
-    def stop(self) -> None:
-        self._command_queue.put(("stop", None, None))
-
-    def _run_ui(self) -> None:
-        try:
-            import tkinter as tk
-        except Exception:
-            self._ready_event.set()
-            return
-
-        root = tk.Tk()
-        root.withdraw()
-        root.overrideredirect(True)
-        root.attributes("-topmost", True)
-        root.attributes("-alpha", self._alpha)
-        root.configure(bg="#ff3b30")
-
-        screen_width = root.winfo_screenwidth()
-        screen_height = root.winfo_screenheight()
-        x = self._margin_px
-        y = screen_height - self._size_px - self._margin_px
-        root.geometry(f"{self._size_px}x{self._size_px}+{x}+{y}")
-
-        try:
-            root.wm_attributes("-toolwindow", True)
-        except Exception:
-            pass
-
-        self._enable_click_through(root)
-        self._ready_event.set()
-
-        hide_job: Optional[str] = None
-
-        def hide_overlay() -> None:
-            root.withdraw()
-
-        def poll_queue() -> None:
-            nonlocal hide_job
-
-            try:
-                while True:
-                    command, color, duration_seconds = self._command_queue.get_nowait()
-
-                    if command == "stop":
-                        root.destroy()
-                        return
-
-                    if command == "flash":
-                        root.configure(bg=str(color))
-                        root.deiconify()
-                        root.lift()
-
-                        if hide_job is not None:
-                            root.after_cancel(hide_job)
-                            hide_job = None
-
-                        hide_job = root.after(int(float(duration_seconds) * 1000), hide_overlay)
-            except queue.Empty:
-                pass
-
-            root.after(80, poll_queue)
-
-        root.after(80, poll_queue)
-        root.mainloop()
-
-    def _enable_click_through(self, root) -> None:
-        """
-        Make the overlay ignore mouse clicks on Windows.
-        """
-        if not sys.platform.startswith("win"):
-            return
-
-        try:
-            import ctypes
-
-            hwnd = root.winfo_id()
-            user32 = ctypes.windll.user32
-            extended_style = user32.GetWindowLongW(hwnd, -20)
-            extended_style |= 0x00000020  # WS_EX_TRANSPARENT
-            extended_style |= 0x00000080  # WS_EX_TOOLWINDOW
-            user32.SetWindowLongW(hwnd, -20, extended_style)
-        except Exception:
-            pass
-
-
-class FallbackPopupNotifier:
-    """
-    Last-resort popup notifier when native Windows notifications are unavailable.
-
-    This intentionally does not depend on external packages.
-    """
-
-    def __init__(self, app_name: str) -> None:
-        self._app_name = app_name
-
-    def show(self, title: str, message: str) -> None:
-        thread = threading.Thread(
-            target=self._show_popup,
-            args=(title, message),
-            daemon=True,
-        )
-        thread.start()
-
-    def _show_popup(self, title: str, message: str) -> None:
-        try:
-            import tkinter as tk
-        except Exception:
-            return
-
-        root = tk.Tk()
-        root.title(title)
-        root.attributes("-topmost", True)
-        root.resizable(False, False)
-
-        width = 340
-        height = 120
-        screen_width = root.winfo_screenwidth()
-        screen_height = root.winfo_screenheight()
-
-        x = max(0, screen_width - width - 24)
-        y = max(0, screen_height - height - 80)
-
-        root.geometry(f"{width}x{height}+{x}+{y}")
-
-        frame = tk.Frame(root, padx=14, pady=12)
-        frame.pack(fill="both", expand=True)
-
-        title_label = tk.Label(frame, text=title, font=("Segoe UI", 11, "bold"), anchor="w", justify="left")
-        title_label.pack(fill="x")
-
-        message_label = tk.Label(frame, text=message, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=300)
-        message_label.pack(fill="both", expand=True, pady=(8, 0))
-
-        root.after(5000, root.destroy)
-        root.mainloop()
-
-
 class ToastNotifier:
     """
     Best-effort desktop notification wrapper.
 
-    The class tries several optional libraries and falls back silently
-    when none are available.
+    The important design choice here is that actual toast delivery happens
+    in a separate worker thread so monitoring never blocks on a toast backend.
     """
 
     def __init__(self, app_name: str) -> None:
@@ -396,7 +259,16 @@ class ToastNotifier:
             return None
 
         def send(title: str, message: str) -> None:
-            toast(title, message, app_id=self._app_name, duration="short")
+            """
+            Keep the notification simple and passive.
+            No buttons, no callbacks, no user action required.
+            """
+            toast(
+                title,
+                message,
+                app_id=self._app_name,
+                duration="short",
+            )
 
         return send
 
@@ -409,7 +281,16 @@ class ToastNotifier:
         toaster = Win10ToastNotifier()
 
         def send(title: str, message: str) -> None:
-            toaster.show_toast(title, message, duration=5, threaded=True)
+            """
+            threaded=True prevents the backend from blocking the caller.
+            """
+            toaster.show_toast(
+                title,
+                message,
+                duration=4,
+                threaded=True,
+                icon_path=None,
+            )
 
         return send
 
@@ -424,7 +305,7 @@ class ToastNotifier:
                 title=title,
                 message=message,
                 app_name=self._app_name,
-                timeout=5,
+                timeout=4,
             )
 
         return send
@@ -433,6 +314,9 @@ class ToastNotifier:
 class NotificationManager:
     """
     High-level notification manager used by the monitoring engine.
+
+    All actual notification delivery is serialized through a background worker.
+    This prevents toast backends from freezing the monitoring loop.
     """
 
     def __init__(
@@ -440,29 +324,29 @@ class NotificationManager:
         app_name: str,
         sound_enabled: bool,
         toast_enabled: bool,
-        overlay_enabled: bool,
-        overlay_size_px: int,
-        overlay_margin_px: int,
-        overlay_alpha: float,
-        overlay_flash_seconds: float,
     ) -> None:
         self._app_name = app_name
         self._sound_enabled = sound_enabled
         self._toast_enabled = toast_enabled
-        self._overlay_enabled = overlay_enabled
-        self._overlay_flash_seconds = overlay_flash_seconds
         self._last_notification_times: dict[str, float] = {}
         self._lock = threading.Lock()
 
         set_windows_app_user_model_id(f"{app_name}.desktop")
-
         self._toast = ToastNotifier(app_name) if toast_enabled else None
-        self._fallback_popup = FallbackPopupNotifier(app_name)
-        self._overlay = CornerOverlay(overlay_size_px, overlay_margin_px, overlay_alpha) if overlay_enabled else None
+
+        self._queue: queue.Queue[Optional[tuple[AlertPayload, bool]]] = queue.Queue()
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop,
+            name="NotificationWorker",
+            daemon=True,
+        )
+        self._worker_thread.start()
 
     def notify(self, key: str, payload: AlertPayload, cooldown_seconds: float) -> None:
         """
-        Send a notification if the per-key cooldown allows it.
+        Queue a notification if the per-key cooldown allows it.
+
+        The monitoring thread returns immediately after pushing to the queue.
         """
         now = time.monotonic()
 
@@ -472,28 +356,40 @@ class NotificationManager:
                 return
             self._last_notification_times[key] = now
 
-        toast_delivered = False
-        if self._toast_enabled and self._toast is not None:
-            toast_delivered = self._toast.show(payload.title, payload.message)
-
-        # If no native toast backend is available, fall back to a popup.
-        # Optionally trigger only the operating system notification sound,
-        # never a custom/generated beep.
-        if not toast_delivered:
-            if self._sound_enabled:
-                threading.Thread(
-                    target=play_system_notification_sound,
-                    daemon=True,
-                ).start()
-
-            self._fallback_popup.show(payload.title, payload.message)
-
-        if self._overlay_enabled and self._overlay is not None:
-            self._overlay.flash(payload.color, self._overlay_flash_seconds)
+        play_sound = self._sound_enabled
+        self._queue.put((payload, play_sound))
 
     def stop(self) -> None:
-        if self._overlay is not None:
-            self._overlay.stop()
+        try:
+            self._queue.put(None)
+            self._worker_thread.join(timeout=2.0)
+        except Exception:
+            pass
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+
+            if item is None:
+                break
+
+            payload, play_sound = item
+
+            toast_delivered = False
+            if self._toast_enabled and self._toast is not None:
+                try:
+                    toast_delivered = self._toast.show(payload.title, payload.message)
+                except Exception:
+                    toast_delivered = False
+
+            if play_sound:
+                try:
+                    play_system_notification_sound()
+                except Exception:
+                    pass
+
+            if not toast_delivered:
+                print(f"[{self._app_name}] {payload.title}: {payload.message}")
 
 
 # ============================================================
@@ -507,7 +403,7 @@ class TrayCallbacks:
     toggle_preview: Callable[[], None]
     recalibrate: Callable[[], None]
     mute_for_fifteen_minutes: Callable[[], None]
-    open_data_folder: Callable[[], None]
+    open_app_folder: Callable[[], None]
     exit_application: Callable[[], None]
 
 
@@ -546,7 +442,7 @@ class TrayController:
             self._pystray.MenuItem("Show / hide preview", self._on_toggle_preview),
             self._pystray.MenuItem("Recalibrate", self._on_recalibrate),
             self._pystray.MenuItem("Mute alerts for 15 minutes", self._on_mute_for_fifteen_minutes),
-            self._pystray.MenuItem("Open app data folder", self._on_open_data_folder),
+            self._pystray.MenuItem("Open app folder", self._on_open_app_folder),
             self._pystray.MenuItem("Exit", self._on_exit),
         )
 
@@ -584,8 +480,8 @@ class TrayController:
     def _on_mute_for_fifteen_minutes(self, icon=None, item=None) -> None:
         self._callbacks.mute_for_fifteen_minutes()
 
-    def _on_open_data_folder(self, icon=None, item=None) -> None:
-        self._callbacks.open_data_folder()
+    def _on_open_app_folder(self, icon=None, item=None) -> None:
+        self._callbacks.open_app_folder()
 
     def _on_exit(self, icon=None, item=None) -> None:
         self._callbacks.exit_application()
@@ -623,6 +519,7 @@ class MonitoringSnapshot:
     stillness_alert_count: int
     reposition_count: int
     muted_until_monotonic: float
+    camera_label: str
 
 
 @dataclass
@@ -630,7 +527,6 @@ class AlertEvent:
     kind: str
     title: str
     message: str
-    color: str
 
 
 class MonitoringEngine:
@@ -682,7 +578,13 @@ class MonitoringEngine:
             stillness_alert_count=0,
             reposition_count=0,
             muted_until_monotonic=0.0,
+            camera_label="Camera not opened yet",
         )
+
+        self._latest_preview_frame = None
+        self._preview_frame_lock = threading.Lock()
+        self._fatal_error_message: Optional[str] = None
+        self._camera_label = "Camera not opened yet"
 
         if config.start_paused:
             self._pause_event.set()
@@ -692,6 +594,7 @@ class MonitoringEngine:
             return
 
         self._stop_event.clear()
+        self._fatal_error_message = None
         self._thread = threading.Thread(target=self._run_loop, name="MonitoringEngine", daemon=True)
         self._thread.start()
 
@@ -699,7 +602,14 @@ class MonitoringEngine:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+        self.clear_preview_frame()
         self._destroy_preview_window()
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def get_fatal_error(self) -> Optional[str]:
+        return self._fatal_error_message
 
     def pause(self) -> None:
         self._pause_event.set()
@@ -710,8 +620,11 @@ class MonitoringEngine:
     def toggle_preview(self) -> None:
         with self._lock:
             self._preview_enabled = not self._preview_enabled
-            if not self._preview_enabled:
-                self._destroy_preview_window()
+            preview_enabled = self._preview_enabled
+
+        if not preview_enabled:
+            self.clear_preview_frame()
+            self._destroy_preview_window()
 
     def request_recalibration(self) -> None:
         with self._lock:
@@ -726,22 +639,45 @@ class MonitoringEngine:
     def get_latest_snapshot(self) -> MonitoringSnapshot:
         return self._latest_snapshot
 
-    def _create_runtime_state(self, baseline: Optional[dict[str, float]]) -> dict:
+    def get_latest_preview_frame(self):
+        with self._preview_frame_lock:
+            if self._latest_preview_frame is None:
+                return None
+            return self._latest_preview_frame.copy()
+
+    def update_preview_frame(self, frame) -> None:
+        with self._preview_frame_lock:
+            self._latest_preview_frame = frame.copy()
+
+    def clear_preview_frame(self) -> None:
+        with self._preview_frame_lock:
+            self._latest_preview_frame = None
+
+    def handle_preview_key(self, key: int) -> None:
+        if key == ord("r"):
+            with self._lock:
+                self._recalibration_requested = True
+        elif key in (ord("p"), ord("q"), 27):
+            with self._lock:
+                self._preview_enabled = False
+            self.clear_preview_frame()
+            self._destroy_preview_window()
+
+    def _create_runtime_state(self) -> dict:
         now = time.monotonic()
         return {
             "calibration_samples": [],
-            "baseline": baseline,
+            "baseline": None,
             "smoothed_metrics": None,
             "previous_metrics": None,
-            "previous_raw_landmarks": None,
             "smoothed_normalized_landmarks": None,
             "smoothed_world_landmarks": None,
             "calibration_start": now,
             "bad_posture_start": None,
             "last_posture_alert_time": -10000.0,
             "last_stillness_alert_time": -10000.0,
-            "last_movement_time": now if baseline is not None else None,
-            "last_reposition_time": now if baseline is not None else None,
+            "last_movement_time": None,
+            "last_reposition_time": None,
             "last_movement_score": 0.0,
             "reposition_count": 0,
             "movement_refresh_streak": 0,
@@ -755,7 +691,6 @@ class MonitoringEngine:
         state["baseline"] = None
         state["smoothed_metrics"] = None
         state["previous_metrics"] = None
-        state["previous_raw_landmarks"] = None
         state["smoothed_normalized_landmarks"] = None
         state["smoothed_world_landmarks"] = None
         state["calibration_start"] = now
@@ -769,41 +704,36 @@ class MonitoringEngine:
         state["filtered_movement_score"] = 0.0
 
     def _run_loop(self) -> None:
-        model_file = get_resource_path(self._config.model_path)
-        stats_file = get_writable_data_path(self._config.stats_path)
-        baseline_file = get_writable_data_path(self._config.baseline_path)
-
-        if not model_file.exists():
-            raise FileNotFoundError(f"Model file not found: {model_file}")
-
-        initial_baseline = None
-        if self._config.persist_baseline_between_runs:
-            initial_baseline = load_baseline(baseline_file)
-
-        state = self._create_runtime_state(initial_baseline)
-
-        capture = open_camera(
-            self._config.camera_index,
-            self._config.frame_width,
-            self._config.frame_height,
-        )
-        if not capture.isOpened():
-            raise RuntimeError("Could not open the camera.")
-
-        options = create_landmarker_options(str(model_file), self._config)
-
-        stream_start = time.monotonic()
-        last_loop_time = time.monotonic()
-        session_start_wall = time.strftime("%Y-%m-%d %H:%M:%S")
-        last_processed_frame_time = 0.0
-        min_frame_interval = 1.0 / self._config.inference_fps if self._config.inference_fps > 0 else 0.0
-
-        bad_posture_total = 0.0
-        static_load_total = 0.0
-        posture_alert_count = 0
-        stillness_alert_count = 0
+        capture: Optional[cv2.VideoCapture] = None
 
         try:
+            model_file = get_resource_path(self._config.model_path)
+            if not model_file.exists():
+                raise FileNotFoundError(f"Model file not found: {model_file}")
+
+            state = self._create_runtime_state()
+
+            camera_result = open_camera(
+                self._config.camera_index,
+                self._config.frame_width,
+                self._config.frame_height,
+            )
+            capture = camera_result.capture
+            self._camera_label = (
+                f"Camera index {camera_result.camera_index} "
+                f"({camera_result.backend_name})"
+            )
+
+            options = create_landmarker_options(str(model_file), self._config)
+
+            stream_start = time.monotonic()
+            last_loop_time = time.monotonic()
+            last_processed_frame_time = 0.0
+            min_frame_interval = 1.0 / self._config.inference_fps if self._config.inference_fps > 0 else 0.0
+
+            posture_alert_count = 0
+            stillness_alert_count = 0
+
             with vision.PoseLandmarker.create_from_options(options) as landmarker:
                 while not self._stop_event.is_set():
                     if self._pause_event.is_set():
@@ -832,8 +762,6 @@ class MonitoringEngine:
                         preview_enabled = self._preview_enabled
                         if self._recalibration_requested:
                             self._reset_for_recalibration(state)
-                            if self._config.persist_baseline_between_runs:
-                                save_baseline(baseline_file, None)
                             self._recalibration_requested = False
 
                     result = detect_pose(landmarker, frame, timestamp_ms)
@@ -851,43 +779,50 @@ class MonitoringEngine:
                     posture_alert_count = snapshot.posture_alert_count
                     stillness_alert_count = snapshot.stillness_alert_count
 
-                    if state["bad_posture_start"] is not None:
-                        bad_posture_total += delta_time if snapshot.zone == "red" else 0.0
-
-                    if snapshot.static_duration >= self._config.static_load_grace_seconds:
-                        static_load_total += delta_time
-
                     self._emit_snapshot(snapshot)
 
                     if alert_event is not None and time.monotonic() >= self._muted_until_monotonic:
                         self._emit_alert(alert_event)
 
                     if preview_enabled:
-                        self._render_preview_frame(frame, snapshot, state)
-                        self._handle_preview_keys()
+                        rendered_frame = self._build_preview_frame(frame, snapshot, state)
+                        self.update_preview_frame(rendered_frame)
                     else:
-                        self._destroy_preview_window()
+                        self.clear_preview_frame()
+
+        except Exception as exc:
+            self._fatal_error_message = str(exc)
+            error_snapshot = MonitoringSnapshot(
+                monitoring_active=False,
+                paused=False,
+                preview_enabled=False,
+                calibrated=False,
+                status_label="Startup error",
+                info_line=str(exc),
+                zone="error",
+                dominant_issue="",
+                total_score=0.0,
+                static_duration=0.0,
+                bad_duration=0.0,
+                movement_score=0.0,
+                head_delta=0.0,
+                torso_delta=0.0,
+                neck_drop=0.0,
+                shoulder_tilt_delta=0.0,
+                head_tilt_delta=0.0,
+                screen_approach_delta=0.0,
+                posture_alert_count=0,
+                stillness_alert_count=0,
+                reposition_count=0,
+                muted_until_monotonic=0.0,
+                camera_label=self._camera_label,
+            )
+            self._emit_snapshot(error_snapshot)
+            print(f"[{self._config.app_name}] startup error: {exc}")
 
         finally:
             safe_release_camera(capture)
-            self._destroy_preview_window()
-
-            if self._config.persist_baseline_between_runs:
-                save_baseline(baseline_file, state["baseline"])
-
-            session_summary = {
-                "started_at": session_start_wall,
-                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "posture_alert_count": posture_alert_count,
-                "stillness_alert_count": stillness_alert_count,
-                "total_alert_count": posture_alert_count + stillness_alert_count,
-                "reposition_count": state["reposition_count"],
-                "bad_posture_total_seconds": round(bad_posture_total, 2),
-                "static_load_total_seconds": round(static_load_total, 2),
-                "was_calibrated": state["baseline"] is not None,
-                "baseline": state["baseline"],
-            }
-            save_stats(stats_file, session_summary)
+            self.clear_preview_frame()
 
     def _handle_paused_state(self, state: dict, posture_alert_count: int, stillness_alert_count: int) -> None:
         snapshot = MonitoringSnapshot(
@@ -913,9 +848,10 @@ class MonitoringEngine:
             stillness_alert_count=stillness_alert_count,
             reposition_count=state["reposition_count"],
             muted_until_monotonic=self._muted_until_monotonic,
+            camera_label=self._camera_label,
         )
         self._emit_snapshot(snapshot)
-        self._destroy_preview_window()
+        self.clear_preview_frame()
         time.sleep(0.15)
 
     def _process_frame(
@@ -1031,6 +967,7 @@ class MonitoringEngine:
             stillness_alert_count=stillness_alert_count,
             reposition_count=state["reposition_count"],
             muted_until_monotonic=self._muted_until_monotonic,
+            camera_label=self._camera_label,
         )
         return snapshot, alert_event
 
@@ -1079,7 +1016,7 @@ class MonitoringEngine:
         """
         Refresh stillness timers only after sustained meaningful movement.
 
-        This avoids static time being reset by tiny frame-to-frame landmark jitter.
+        This avoids resetting static time because of tiny landmark jitter.
         """
         if movement_score >= self._config.movement_refresh_threshold:
             state["movement_refresh_streak"] += 1
@@ -1203,7 +1140,6 @@ class MonitoringEngine:
                     kind="posture",
                     title="Posture Guard",
                     message=f"Adjust posture: {dominant_issue}.",
-                    color="#ff3b30",
                 )
 
         can_send_stillness_reminder = (
@@ -1221,7 +1157,6 @@ class MonitoringEngine:
                     kind="stillness",
                     title="Posture Guard",
                     message="Time to change position or move a little.",
-                    color="#ff3b30",
                 )
 
         if zone != "red" and static_duration >= self._config.stillness_reminder_after_seconds:
@@ -1247,27 +1182,30 @@ class MonitoringEngine:
             stillness_alert_count,
         )
 
-    def _render_preview_frame(self, frame, snapshot: MonitoringSnapshot, state: dict) -> None:
+    def _build_preview_frame(self, frame, snapshot: MonitoringSnapshot, state: dict):
+        rendered = frame.copy()
+
         smoothed_landmarks = state["smoothed_normalized_landmarks"]
         if smoothed_landmarks:
-            draw_pose(frame, smoothed_landmarks, self._config)
+            draw_pose(rendered, smoothed_landmarks, self._config)
 
-        draw_text(frame, self._config.app_name, 0, (255, 255, 255))
+        draw_text(rendered, self._config.app_name, 0, (255, 255, 255))
+        draw_text(rendered, self._camera_label, 1, (200, 200, 200))
 
         if not snapshot.calibrated:
             remaining = max(
                 0.0,
                 self._config.calibration_seconds - (time.monotonic() - state["calibration_start"]),
             )
-            draw_text(frame, f"Status: calibration ({remaining:0.1f}s left)", 1, (0, 255, 255))
+            draw_text(rendered, f"Status: calibration ({remaining:0.1f}s left)", 2, (0, 255, 255))
             draw_text(
-                frame,
+                rendered,
                 f"Samples: {len(state['calibration_samples'])}/{self._config.calibration_min_samples}",
-                2,
+                3,
                 (255, 255, 255),
             )
-            draw_text(frame, "Sit naturally, look at the screen, do not freeze completely.", 3, (220, 220, 220))
-            draw_text(frame, "Controls: R - recalibrate | P/Q/Esc - hide preview", 5, (220, 220, 220))
+            draw_text(rendered, "Sit naturally, look at the screen, do not freeze completely.", 4, (220, 220, 220))
+            draw_text(rendered, "Controls: R - recalibrate | P/Q/Esc - hide preview", 6, (220, 220, 220))
         else:
             color = (255, 255, 255)
             if snapshot.zone == "green":
@@ -1277,68 +1215,57 @@ class MonitoringEngine:
             elif snapshot.zone == "red":
                 color = (0, 0, 255)
 
-            draw_text(frame, f"Status: {snapshot.status_label}", 1, color)
-            draw_text(frame, f"Info: {snapshot.info_line}", 2, (255, 255, 255))
+            draw_text(rendered, f"Status: {snapshot.status_label}", 2, color)
+            draw_text(rendered, f"Info: {snapshot.info_line}", 3, (255, 255, 255))
             draw_text(
-                frame,
+                rendered,
                 f"Strain score: {snapshot.total_score:0.2f} | Static time: {snapshot.static_duration:0.1f}s",
-                3,
-                (255, 255, 255),
-            )
-            draw_text(
-                frame,
-                f"Head: {snapshot.head_delta:+0.3f} m | Torso: {snapshot.torso_delta:+0.1f} deg | Neck: {snapshot.neck_drop:+0.3f} m",
                 4,
                 (255, 255, 255),
             )
             draw_text(
-                frame,
-                f"Shoulders: {snapshot.shoulder_tilt_delta:+0.1f} deg | Head tilt: {snapshot.head_tilt_delta:+0.1f} deg",
+                rendered,
+                f"Head: {snapshot.head_delta:+0.3f} m | Torso: {snapshot.torso_delta:+0.1f} deg | Neck: {snapshot.neck_drop:+0.3f} m",
                 5,
                 (255, 255, 255),
             )
             draw_text(
-                frame,
-                f"Screen approach: {snapshot.screen_approach_delta:+0.3f} | Movement score: {snapshot.movement_score:0.2f}",
+                rendered,
+                f"Shoulders: {snapshot.shoulder_tilt_delta:+0.1f} deg | Head tilt: {snapshot.head_tilt_delta:+0.1f} deg",
                 6,
                 (255, 255, 255),
             )
             draw_text(
-                frame,
-                f"Bad posture: {snapshot.bad_duration:0.1f}s | Posture alerts: {snapshot.posture_alert_count}",
+                rendered,
+                f"Screen approach: {snapshot.screen_approach_delta:+0.3f} | Movement score: {snapshot.movement_score:0.2f}",
                 7,
                 (255, 255, 255),
             )
             draw_text(
-                frame,
-                f"Move reminders: {snapshot.stillness_alert_count} | Repositions: {snapshot.reposition_count}",
+                rendered,
+                f"Bad posture: {snapshot.bad_duration:0.1f}s | Posture alerts: {snapshot.posture_alert_count}",
                 8,
                 (255, 255, 255),
             )
-            draw_text(frame, "Controls: R - recalibrate | P/Q/Esc - hide preview", 10, (220, 220, 220))
+            draw_text(
+                rendered,
+                f"Move reminders: {snapshot.stillness_alert_count} | Repositions: {snapshot.reposition_count}",
+                9,
+                (255, 255, 255),
+            )
+            draw_text(rendered, "Controls: R - recalibrate | P/Q/Esc - hide preview", 11, (220, 220, 220))
 
             if snapshot.zone == "red":
                 cv2.rectangle(
-                    frame,
+                    rendered,
                     (10, 10),
-                    (frame.shape[1] - 10, frame.shape[0] - 10),
+                    (rendered.shape[1] - 10, rendered.shape[0] - 10),
                     (0, 0, 255),
                     4,
                 )
-                draw_text(frame, "ALERT: Adjust posture", 12, (0, 0, 255))
+                draw_text(rendered, "ALERT: Adjust posture", 12, (0, 0, 255))
 
-        cv2.imshow(self._config.app_name, frame)
-
-    def _handle_preview_keys(self) -> None:
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("r"):
-            with self._lock:
-                self._recalibration_requested = True
-        elif key in (ord("p"), ord("q"), 27):
-            with self._lock:
-                self._preview_enabled = False
-            self._destroy_preview_window()
+        return rendered
 
     def _destroy_preview_window(self) -> None:
         try:
@@ -1374,11 +1301,12 @@ class PostureGuardApplication:
     """
 
     def __init__(self) -> None:
-        self._data_dir = get_writable_base_directory()
-        self._config_file = get_writable_data_path("data/config.json")
+        self._runtime_dir = get_runtime_directory()
+        self._data_dir = get_data_directory()
+        self._config_file = get_config_file_path()
         self._config = load_app_config(self._config_file)
-        self._config.config_path = "data/config.json"
 
+        # Keep the mutable data folder one level above the app directory.
         save_app_config(self._config_file, self._config)
 
         self._exit_event = threading.Event()
@@ -1388,11 +1316,6 @@ class PostureGuardApplication:
             app_name=self._config.app_name,
             sound_enabled=self._config.sound_enabled,
             toast_enabled=self._config.toast_notifications_enabled,
-            overlay_enabled=self._config.overlay_enabled,
-            overlay_size_px=self._config.overlay_size_px,
-            overlay_margin_px=self._config.overlay_margin_px,
-            overlay_alpha=self._config.overlay_alpha,
-            overlay_flash_seconds=self._config.overlay_flash_seconds,
         )
 
         self._engine = MonitoringEngine(
@@ -1409,7 +1332,7 @@ class PostureGuardApplication:
                 toggle_preview=self._engine.toggle_preview,
                 recalibrate=self._engine.request_recalibration,
                 mute_for_fifteen_minutes=self._mute_for_fifteen_minutes,
-                open_data_folder=self._open_data_folder,
+                open_app_folder=self._open_app_folder,
                 exit_application=self.stop,
             ),
         )
@@ -1418,18 +1341,31 @@ class PostureGuardApplication:
         self._install_signal_handlers()
         self._engine.start()
 
+        tray_started = False
         if self._config.tray_enabled:
-            self._tray.start()
+            tray_started = self._tray.start()
+
+        if self._config.tray_enabled and not tray_started:
+            print("Tray integration is unavailable. The app will continue without tray controls.")
+
+        if not self._config.preview_enabled:
+            print("Preview was disabled in config, so it is being enabled automatically on startup.")
+            self._config.preview_enabled = True
+            save_app_config(self._config_file, self._config)
+            self._engine.toggle_preview()
 
         print(f"[{self._config.app_name}] running")
+        print(f"App folder: {self._runtime_dir}")
         print(f"Data folder: {self._data_dir}")
         print(f"Config file: {self._config_file}")
-        if not self._config.preview_enabled:
-            print("Preview starts hidden. Use the tray icon to show or hide it.")
+        print("Camera preview should appear in a separate OpenCV window.")
+        print("Controls in preview: R - recalibrate | P/Q/Esc - hide preview")
 
         try:
             while not self._exit_event.is_set():
-                time.sleep(0.2)
+                self._pump_preview()
+                self._check_engine_health()
+                time.sleep(0.01)
         finally:
             self.stop()
 
@@ -1442,6 +1378,42 @@ class PostureGuardApplication:
         self._engine.stop()
         self._notifications.stop()
 
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+    def _pump_preview(self) -> None:
+        snapshot = self._engine.get_latest_snapshot()
+
+        if not snapshot.preview_enabled:
+            try:
+                cv2.destroyWindow(self._config.app_name)
+            except Exception:
+                pass
+            return
+
+        frame = self._engine.get_latest_preview_frame()
+        if frame is None:
+            return
+
+        cv2.imshow(self._config.app_name, frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key != 255:
+            self._engine.handle_preview_key(key)
+
+    def _check_engine_health(self) -> None:
+        if self._engine.is_running():
+            return
+
+        fatal_error = self._engine.get_fatal_error()
+        if fatal_error:
+            print(f"[{self._config.app_name}] fatal error: {fatal_error}")
+        else:
+            print(f"[{self._config.app_name}] monitoring engine stopped unexpectedly.")
+
+        self.stop()
+
     def _on_snapshot(self, snapshot: MonitoringSnapshot) -> None:
         self._latest_snapshot = snapshot
 
@@ -1449,7 +1421,6 @@ class PostureGuardApplication:
         payload = AlertPayload(
             title=event.title,
             message=event.message,
-            color=event.color,
         )
         self._notifications.notify(
             key=event.kind,
@@ -1464,23 +1435,22 @@ class PostureGuardApplication:
             payload=AlertPayload(
                 title="Posture Guard",
                 message="Alerts muted for 15 minutes.",
-                color="#ff9500",
             ),
             cooldown_seconds=1.0,
         )
 
-    def _open_data_folder(self) -> None:
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-
+    def _open_app_folder(self) -> None:
         try:
             if sys.platform.startswith("win"):
-                os.startfile(str(self._data_dir))
+                os.startfile(str(self._runtime_dir))
             elif sys.platform == "darwin":
                 import subprocess
-                subprocess.Popen(["open", str(self._data_dir)])
+
+                subprocess.Popen(["open", str(self._runtime_dir)])
             else:
                 import subprocess
-                subprocess.Popen(["xdg-open", str(self._data_dir)])
+
+                subprocess.Popen(["xdg-open", str(self._runtime_dir)])
         except Exception:
             pass
 
