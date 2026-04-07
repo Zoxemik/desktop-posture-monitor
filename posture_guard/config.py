@@ -44,8 +44,8 @@ class AppConfig:
 
     # Alert policy.
     posture_alert_after_seconds: float = 5.0
-    posture_alert_cooldown_seconds: float = 5.0
-    stillness_reminder_after_seconds: float = 15.0
+    posture_alert_cooldown_seconds: float = 15.0
+    stillness_reminder_after_seconds: float = 180.0
     stillness_alert_cooldown_seconds: float = 10.0
 
     # Static load policy.
