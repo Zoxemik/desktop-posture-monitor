@@ -77,13 +77,24 @@ class AppConfig:
     movement_head_forward_unit: float = 0.008
     movement_torso_angle_unit: float = 3.5
     movement_neck_gap_unit: float = 0.008
-    movement_shoulder_width_unit: float = 0.025
+    movement_screen_approach_unit: float = 0.025
     movement_shoulder_tilt_unit: float = 4.0
     movement_head_tilt_unit: float = 4.0
     movement_head_side_shift_unit: float = 0.010
 
     # Notification throttling.
     duplicate_notification_cooldown_seconds: float = 10.0
+
+    # Compact session telemetry.
+    telemetry_enabled: bool = True
+    telemetry_flush_interval_seconds: float = 1.0
+
+    # Automatic baseline refresh after a meaningful seat reposition.
+    auto_recalibration_enabled: bool = True
+    auto_recalibration_stability_seconds: float = 2.0
+    auto_recalibration_max_score: float = 0.35
+    auto_recalibration_min_time_since_baseline_seconds: float = 20.0
+    auto_recalibration_cooldown_seconds: float = 30.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":

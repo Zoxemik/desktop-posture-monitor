@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -32,6 +33,7 @@ from posture import draw_text
 from posture import evaluate_ergonomics
 from posture import smooth_landmarks
 from posture import smooth_metrics
+from telemetry import TelemetryLogger
 
 
 # ============================================================
@@ -71,17 +73,16 @@ def get_data_directory() -> Path:
     """
     Return the directory used for mutable runtime files.
 
-    The data directory is stored one level above the application directory,
-    exactly as requested.
+    The data directory is stored inside the application directory.
     """
-    data_dir = get_runtime_directory().parent / DATA_DIR_NAME
+    data_dir = get_runtime_directory() / DATA_DIR_NAME
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
 
 
 def get_config_file_path() -> Path:
     """
-    Store config in ../data/config.json relative to the app directory.
+    Store config in data/config.json relative to the app directory.
     """
     return get_data_directory() / CONFIG_FILE_NAME
 
@@ -156,7 +157,10 @@ def open_camera(camera_index: int, frame_width: int, frame_height: int) -> Camer
                     backend_name=backend_name,
                 )
 
-            last_error = f"Camera opened but did not return frames (index={candidate_index}, backend={backend_name})"
+            last_error = (
+                f"Camera opened but did not return frames "
+                f"(index={candidate_index}, backend={backend_name})"
+            )
             capture.release()
 
     raise RuntimeError(
@@ -487,20 +491,14 @@ class TrayController:
         self._callbacks.exit_application()
 
 
-# ============================================================
-# Monitoring engine
-# ============================================================
-
-SnapshotCallback = Callable[["MonitoringSnapshot"], None]
-AlertCallback = Callable[["AlertEvent"], None]
-
-
 @dataclass
 class MonitoringSnapshot:
     monitoring_active: bool
     paused: bool
     preview_enabled: bool
     calibrated: bool
+    pose_detected: bool
+    reliable_pose: bool
     status_label: str
     info_line: str
     zone: str
@@ -519,6 +517,9 @@ class MonitoringSnapshot:
     stillness_alert_count: int
     reposition_count: int
     muted_until_monotonic: float
+    loop_latency_ms: float
+    baseline_generation: int
+    recalibration_reason: str
     camera_label: str
 
 
@@ -534,16 +535,18 @@ class MonitoringEngine:
     Background monitoring engine.
 
     It owns the camera, MediaPipe processing, calibration logic,
-    posture evaluation and alert scheduling.
+    posture evaluation, telemetry logging and alert scheduling.
     """
 
     def __init__(
         self,
         config: AppConfig,
-        on_snapshot: Optional[SnapshotCallback] = None,
-        on_alert: Optional[AlertCallback] = None,
+        data_dir: Path,
+        on_snapshot: Optional[Callable[["MonitoringSnapshot"], None]] = None,
+        on_alert: Optional[Callable[["AlertEvent"], None]] = None,
     ) -> None:
         self._config = config
+        self._data_dir = data_dir
         self._on_snapshot = on_snapshot
         self._on_alert = on_alert
 
@@ -554,12 +557,15 @@ class MonitoringEngine:
 
         self._preview_enabled = config.preview_enabled
         self._recalibration_requested = False
+        self._requested_recalibration_reason: Optional[str] = None
         self._muted_until_monotonic = 0.0
         self._latest_snapshot = MonitoringSnapshot(
             monitoring_active=False,
             paused=config.start_paused,
             preview_enabled=config.preview_enabled,
             calibrated=False,
+            pose_detected=False,
+            reliable_pose=False,
             status_label="Starting",
             info_line="",
             zone="unknown",
@@ -578,6 +584,9 @@ class MonitoringEngine:
             stillness_alert_count=0,
             reposition_count=0,
             muted_until_monotonic=0.0,
+            loop_latency_ms=0.0,
+            baseline_generation=0,
+            recalibration_reason="initial_calibration",
             camera_label="Camera not opened yet",
         )
 
@@ -585,6 +594,19 @@ class MonitoringEngine:
         self._preview_frame_lock = threading.Lock()
         self._fatal_error_message: Optional[str] = None
         self._camera_label = "Camera not opened yet"
+
+        self._telemetry = TelemetryLogger(
+            data_dir=data_dir,
+            app_name=config.app_name,
+            enabled=config.telemetry_enabled,
+            flush_interval_seconds=config.telemetry_flush_interval_seconds,
+        )
+        self._telemetry.write_session_metadata(
+            config_snapshot=config.to_dict(),
+            extra={
+                "data_dir": str(data_dir),
+            },
+        )
 
         if config.start_paused:
             self._pause_event.set()
@@ -604,6 +626,7 @@ class MonitoringEngine:
             self._thread.join(timeout=5.0)
         self.clear_preview_frame()
         self._destroy_preview_window()
+        self._telemetry.close()
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -629,6 +652,7 @@ class MonitoringEngine:
     def request_recalibration(self) -> None:
         with self._lock:
             self._recalibration_requested = True
+            self._requested_recalibration_reason = "manual_request"
 
     def mute_for_seconds(self, seconds: float) -> None:
         self._muted_until_monotonic = max(
@@ -657,6 +681,7 @@ class MonitoringEngine:
         if key == ord("r"):
             with self._lock:
                 self._recalibration_requested = True
+                self._requested_recalibration_reason = "manual_request"
         elif key in (ord("p"), ord("q"), 27):
             with self._lock:
                 self._preview_enabled = False
@@ -672,6 +697,10 @@ class MonitoringEngine:
             "previous_metrics": None,
             "smoothed_normalized_landmarks": None,
             "smoothed_world_landmarks": None,
+            "latest_metrics": None,
+            "latest_evaluation": None,
+            "latest_pose_detected": False,
+            "latest_reliable_pose": False,
             "calibration_start": now,
             "bad_posture_start": None,
             "last_posture_alert_time": -10000.0,
@@ -679,13 +708,27 @@ class MonitoringEngine:
             "last_movement_time": None,
             "last_reposition_time": None,
             "last_movement_score": 0.0,
+            "last_raw_movement_score": 0.0,
             "reposition_count": 0,
             "movement_refresh_streak": 0,
             "movement_reposition_streak": 0,
             "filtered_movement_score": 0.0,
+            "baseline_generation": 0,
+            "baseline_established_at": None,
+            "auto_recalibration_pending": False,
+            "auto_recalibration_candidate_since": None,
+            "last_auto_recalibration_time": None,
+            "last_recalibration_reason": "initial_calibration",
+            "last_logged_zone": None,
+            "frame_index": 0,
+            "last_stream_timestamp_ms": 0,
+            "loop_latency_ms": 0.0,
+            "posture_alert_fired": False,
+            "stillness_alert_fired": False,
+            "auto_recalibration_started": False,
         }
 
-    def _reset_for_recalibration(self, state: dict) -> None:
+    def _reset_for_recalibration(self, state: dict, reason: str) -> None:
         now = time.monotonic()
         state["calibration_samples"] = []
         state["baseline"] = None
@@ -693,15 +736,35 @@ class MonitoringEngine:
         state["previous_metrics"] = None
         state["smoothed_normalized_landmarks"] = None
         state["smoothed_world_landmarks"] = None
+        state["latest_metrics"] = None
+        state["latest_evaluation"] = None
+        state["latest_pose_detected"] = False
+        state["latest_reliable_pose"] = False
         state["calibration_start"] = now
         state["bad_posture_start"] = None
         state["last_movement_time"] = None
-        state["last_reposition_time"] = None
         state["last_movement_score"] = 0.0
-        state["reposition_count"] = 0
+        state["last_raw_movement_score"] = 0.0
         state["movement_refresh_streak"] = 0
         state["movement_reposition_streak"] = 0
         state["filtered_movement_score"] = 0.0
+        state["auto_recalibration_pending"] = False
+        state["auto_recalibration_candidate_since"] = None
+        state["posture_alert_fired"] = False
+        state["stillness_alert_fired"] = False
+        state["auto_recalibration_started"] = False
+        state["last_logged_zone"] = None
+        state["last_recalibration_reason"] = reason
+
+        self._log_event(
+            kind="recalibration_started",
+            title="Recalibration",
+            message=reason,
+            state=state,
+            zone="calibration",
+            dominant_issue="",
+            total_score=0.0,
+        )
 
     def _run_loop(self) -> None:
         capture: Optional[cv2.VideoCapture] = None
@@ -722,6 +785,16 @@ class MonitoringEngine:
             self._camera_label = (
                 f"Camera index {camera_result.camera_index} "
                 f"({camera_result.backend_name})"
+            )
+
+            self._log_event(
+                kind="session_started",
+                title="Session",
+                message=self._camera_label,
+                state=state,
+                zone="startup",
+                dominant_issue="",
+                total_score=0.0,
             )
 
             options = create_landmarker_options(str(model_file), self._config)
@@ -761,28 +834,81 @@ class MonitoringEngine:
                     with self._lock:
                         preview_enabled = self._preview_enabled
                         if self._recalibration_requested:
-                            self._reset_for_recalibration(state)
+                            reason = self._requested_recalibration_reason or "manual_request"
+                            self._reset_for_recalibration(state, reason)
                             self._recalibration_requested = False
+                            self._requested_recalibration_reason = None
 
+                    state["frame_index"] += 1
+                    state["last_stream_timestamp_ms"] = timestamp_ms
+
+                    processing_start = time.monotonic()
                     result = detect_pose(landmarker, frame, timestamp_ms)
 
                     snapshot, alert_event = self._process_frame(
                         result=result,
                         now=now,
                         delta_time=delta_time,
+                        stream_timestamp_ms=timestamp_ms,
                         state=state,
                         posture_alert_count=posture_alert_count,
                         stillness_alert_count=stillness_alert_count,
                         preview_enabled=preview_enabled,
                     )
 
+                    processing_latency_ms = (time.monotonic() - processing_start) * 1000.0
+                    state["loop_latency_ms"] = processing_latency_ms
+
+                    if processing_latency_ms != snapshot.loop_latency_ms:
+                        snapshot = MonitoringSnapshot(
+                            monitoring_active=snapshot.monitoring_active,
+                            paused=snapshot.paused,
+                            preview_enabled=snapshot.preview_enabled,
+                            calibrated=snapshot.calibrated,
+                            pose_detected=snapshot.pose_detected,
+                            reliable_pose=snapshot.reliable_pose,
+                            status_label=snapshot.status_label,
+                            info_line=snapshot.info_line,
+                            zone=snapshot.zone,
+                            dominant_issue=snapshot.dominant_issue,
+                            total_score=snapshot.total_score,
+                            static_duration=snapshot.static_duration,
+                            bad_duration=snapshot.bad_duration,
+                            movement_score=snapshot.movement_score,
+                            head_delta=snapshot.head_delta,
+                            torso_delta=snapshot.torso_delta,
+                            neck_drop=snapshot.neck_drop,
+                            shoulder_tilt_delta=snapshot.shoulder_tilt_delta,
+                            head_tilt_delta=snapshot.head_tilt_delta,
+                            screen_approach_delta=snapshot.screen_approach_delta,
+                            posture_alert_count=snapshot.posture_alert_count,
+                            stillness_alert_count=snapshot.stillness_alert_count,
+                            reposition_count=snapshot.reposition_count,
+                            muted_until_monotonic=snapshot.muted_until_monotonic,
+                            loop_latency_ms=processing_latency_ms,
+                            baseline_generation=snapshot.baseline_generation,
+                            recalibration_reason=snapshot.recalibration_reason,
+                            camera_label=snapshot.camera_label,
+                        )
+
                     posture_alert_count = snapshot.posture_alert_count
                     stillness_alert_count = snapshot.stillness_alert_count
 
                     self._emit_snapshot(snapshot)
+                    self._log_frame_telemetry(snapshot, state)
 
-                    if alert_event is not None and time.monotonic() >= self._muted_until_monotonic:
-                        self._emit_alert(alert_event)
+                    if alert_event is not None:
+                        self._log_event(
+                            kind=alert_event.kind,
+                            title=alert_event.title,
+                            message=alert_event.message,
+                            state=state,
+                            zone=snapshot.zone,
+                            dominant_issue=snapshot.dominant_issue,
+                            total_score=snapshot.total_score,
+                        )
+                        if time.monotonic() >= self._muted_until_monotonic:
+                            self._emit_alert(alert_event)
 
                     if preview_enabled:
                         rendered_frame = self._build_preview_frame(frame, snapshot, state)
@@ -792,11 +918,26 @@ class MonitoringEngine:
 
         except Exception as exc:
             self._fatal_error_message = str(exc)
+            self._log_event(
+                kind="startup_error",
+                title="Startup error",
+                message=str(exc),
+                state={
+                    "frame_index": 0,
+                    "baseline_generation": 0,
+                    "last_recalibration_reason": "startup_error",
+                },
+                zone="error",
+                dominant_issue="",
+                total_score=0.0,
+            )
             error_snapshot = MonitoringSnapshot(
                 monitoring_active=False,
                 paused=False,
                 preview_enabled=False,
                 calibrated=False,
+                pose_detected=False,
+                reliable_pose=False,
                 status_label="Startup error",
                 info_line=str(exc),
                 zone="error",
@@ -815,6 +956,9 @@ class MonitoringEngine:
                 stillness_alert_count=0,
                 reposition_count=0,
                 muted_until_monotonic=0.0,
+                loop_latency_ms=0.0,
+                baseline_generation=0,
+                recalibration_reason="startup_error",
                 camera_label=self._camera_label,
             )
             self._emit_snapshot(error_snapshot)
@@ -825,11 +969,18 @@ class MonitoringEngine:
             self.clear_preview_frame()
 
     def _handle_paused_state(self, state: dict, posture_alert_count: int, stillness_alert_count: int) -> None:
+        state["latest_metrics"] = None
+        state["latest_evaluation"] = None
+        state["latest_pose_detected"] = False
+        state["latest_reliable_pose"] = False
+
         snapshot = MonitoringSnapshot(
             monitoring_active=True,
             paused=True,
             preview_enabled=self._preview_enabled,
             calibrated=state["baseline"] is not None,
+            pose_detected=False,
+            reliable_pose=False,
             status_label="Paused",
             info_line="Monitoring is paused from the tray menu.",
             zone="paused",
@@ -848,9 +999,14 @@ class MonitoringEngine:
             stillness_alert_count=stillness_alert_count,
             reposition_count=state["reposition_count"],
             muted_until_monotonic=self._muted_until_monotonic,
+            loop_latency_ms=0.0,
+            baseline_generation=state["baseline_generation"],
+            recalibration_reason=state["last_recalibration_reason"],
             camera_label=self._camera_label,
         )
+
         self._emit_snapshot(snapshot)
+        self._log_frame_telemetry(snapshot, state)
         self.clear_preview_frame()
         time.sleep(0.15)
 
@@ -859,11 +1015,14 @@ class MonitoringEngine:
         result,
         now: float,
         delta_time: float,
+        stream_timestamp_ms: int,
         state: dict,
         posture_alert_count: int,
         stillness_alert_count: int,
         preview_enabled: bool,
     ) -> tuple[MonitoringSnapshot, Optional[AlertEvent]]:
+        _ = stream_timestamp_ms
+
         status_label = "No person detected"
         info_line = "Adjust your position so the upper body is visible."
         alert_event: Optional[AlertEvent] = None
@@ -879,8 +1038,19 @@ class MonitoringEngine:
         movement_score = state["last_movement_score"]
         dominant_issue = ""
         zone = "no_person"
+        pose_detected = False
+        reliable_pose = False
+
+        state["latest_metrics"] = None
+        state["latest_evaluation"] = None
+        state["latest_pose_detected"] = False
+        state["latest_reliable_pose"] = False
+        state["posture_alert_fired"] = False
+        state["stillness_alert_fired"] = False
+        state["auto_recalibration_started"] = False
 
         if result.pose_landmarks and result.pose_world_landmarks:
+            pose_detected = True
             raw_normalized_landmarks = result.pose_landmarks[0]
             raw_world_landmarks = result.pose_world_landmarks[0]
 
@@ -907,9 +1077,14 @@ class MonitoringEngine:
                 state["bad_posture_start"] = None
                 state["movement_refresh_streak"] = 0
                 state["movement_reposition_streak"] = 0
+
             elif state["baseline"] is None:
+                reliable_pose = True
+                state["latest_metrics"] = dict(raw_metrics)
                 status_label, info_line, zone = self._handle_calibration(raw_metrics, now, state)
+
             else:
+                reliable_pose = True
                 (
                     status_label,
                     info_line,
@@ -940,6 +1115,9 @@ class MonitoringEngine:
             state["movement_refresh_streak"] = 0
             state["movement_reposition_streak"] = 0
 
+        state["latest_pose_detected"] = pose_detected
+        state["latest_reliable_pose"] = reliable_pose
+
         bad_duration = 0.0
         if state["bad_posture_start"] is not None:
             bad_duration = now - state["bad_posture_start"]
@@ -949,6 +1127,8 @@ class MonitoringEngine:
             paused=False,
             preview_enabled=preview_enabled,
             calibrated=state["baseline"] is not None,
+            pose_detected=pose_detected,
+            reliable_pose=reliable_pose,
             status_label=status_label,
             info_line=info_line,
             zone=zone,
@@ -967,6 +1147,9 @@ class MonitoringEngine:
             stillness_alert_count=stillness_alert_count,
             reposition_count=state["reposition_count"],
             muted_until_monotonic=self._muted_until_monotonic,
+            loop_latency_ms=state["loop_latency_ms"],
+            baseline_generation=state["baseline_generation"],
+            recalibration_reason=state["last_recalibration_reason"],
             camera_label=self._camera_label,
         )
         return snapshot, alert_event
@@ -992,9 +1175,25 @@ class MonitoringEngine:
             state["last_movement_time"] = now
             state["last_reposition_time"] = now
             state["last_movement_score"] = 0.0
+            state["last_raw_movement_score"] = 0.0
             state["filtered_movement_score"] = 0.0
             state["movement_refresh_streak"] = 0
             state["movement_reposition_streak"] = 0
+            state["baseline_generation"] += 1
+            state["baseline_established_at"] = now
+            state["auto_recalibration_pending"] = False
+            state["auto_recalibration_candidate_since"] = None
+            state["last_logged_zone"] = None
+
+            self._log_event(
+                kind="baseline_ready",
+                title="Baseline ready",
+                message=state["last_recalibration_reason"],
+                state=state,
+                zone="calibration",
+                dominant_issue="",
+                total_score=0.0,
+            )
 
         return status_label, info_line, zone
 
@@ -1011,6 +1210,17 @@ class MonitoringEngine:
 
         state["filtered_movement_score"] = filtered
         return filtered
+
+    def _get_pose_state(self, snapshot: MonitoringSnapshot) -> str:
+        if snapshot.paused:
+            return "paused"
+        if not snapshot.calibrated:
+            return "calibration"
+        if not snapshot.pose_detected:
+            return "no_person"
+        if not snapshot.reliable_pose:
+            return "unreliable"
+        return "tracking"
 
     def _update_movement_timers(self, movement_score: float, now: float, state: dict) -> None:
         """
@@ -1042,8 +1252,61 @@ class MonitoringEngine:
                 state["last_reposition_time"] = now
                 state["last_movement_time"] = now
                 state["reposition_count"] += 1
+                state["auto_recalibration_pending"] = True
+                state["auto_recalibration_candidate_since"] = None
 
             state["movement_reposition_streak"] = 0
+
+    def _maybe_start_auto_recalibration(
+        self,
+        now: float,
+        movement_score: float,
+        evaluation: dict[str, object],
+        state: dict,
+    ) -> bool:
+        if not self._config.auto_recalibration_enabled:
+            return False
+
+        if not state["auto_recalibration_pending"]:
+            return False
+
+        baseline_established_at = state["baseline_established_at"]
+        if baseline_established_at is None:
+            return False
+
+        if (now - baseline_established_at) < self._config.auto_recalibration_min_time_since_baseline_seconds:
+            return False
+
+        last_auto_recalibration_time = state["last_auto_recalibration_time"]
+        if (
+            last_auto_recalibration_time is not None
+            and (now - last_auto_recalibration_time) < self._config.auto_recalibration_cooldown_seconds
+        ):
+            return False
+
+        total_score = float(evaluation["total_score"])
+        zone = str(evaluation["zone"])
+
+        if zone != "green" or total_score > self._config.auto_recalibration_max_score:
+            state["auto_recalibration_candidate_since"] = None
+            return False
+
+        if movement_score > self._config.movement_deadband:
+            state["auto_recalibration_candidate_since"] = None
+            return False
+
+        if state["auto_recalibration_candidate_since"] is None:
+            state["auto_recalibration_candidate_since"] = now
+            return False
+
+        stable_duration = now - state["auto_recalibration_candidate_since"]
+        if stable_duration < self._config.auto_recalibration_stability_seconds:
+            return False
+
+        state["last_auto_recalibration_time"] = now
+        self._reset_for_recalibration(state, "auto_recalibration_after_reposition")
+        state["auto_recalibration_started"] = True
+        return True
 
     def _evaluate_calibrated_posture(
         self,
@@ -1071,6 +1334,8 @@ class MonitoringEngine:
         int,
         int,
     ]:
+        _ = delta_time
+
         smoothed_metrics = smooth_metrics(
             state["smoothed_metrics"],
             raw_metrics,
@@ -1083,6 +1348,7 @@ class MonitoringEngine:
             self._config,
         )
         movement_score = self._filter_movement_score(raw_movement_score, state)
+        state["last_raw_movement_score"] = raw_movement_score
         state["last_movement_score"] = movement_score
 
         self._update_movement_timers(movement_score, now, state)
@@ -1090,6 +1356,28 @@ class MonitoringEngine:
         evaluation = evaluate_ergonomics(smoothed_metrics, state["baseline"], self._config)
         state["smoothed_metrics"] = smoothed_metrics
         state["previous_metrics"] = dict(smoothed_metrics)
+        state["latest_metrics"] = dict(smoothed_metrics)
+        state["latest_evaluation"] = dict(evaluation)
+
+        if self._maybe_start_auto_recalibration(now, movement_score, evaluation, state):
+            return (
+                "Auto recalibration",
+                "Seat position changed. Updating baseline.",
+                "calibration",
+                "",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                movement_score,
+                None,
+                posture_alert_count,
+                stillness_alert_count,
+            )
 
         total_score = float(evaluation["total_score"])
         head_delta = float(evaluation["head_delta"])
@@ -1115,7 +1403,10 @@ class MonitoringEngine:
 
         elif zone == "yellow":
             status_label = "Drifting from neutral"
-            info_line = f"Watch this trend: {dominant_issue}."
+            if dominant_issue:
+                info_line = f"Watch this trend: {dominant_issue}."
+            else:
+                info_line = "Small deviation detected."
             state["bad_posture_start"] = None
 
         else:
@@ -1136,6 +1427,7 @@ class MonitoringEngine:
             if can_alert_by_duration and can_alert_by_cooldown:
                 state["last_posture_alert_time"] = now
                 posture_alert_count += 1
+                state["posture_alert_fired"] = True
                 alert_event = AlertEvent(
                     kind="posture",
                     title="Posture Guard",
@@ -1151,6 +1443,7 @@ class MonitoringEngine:
         if can_send_stillness_reminder:
             state["last_stillness_alert_time"] = now
             stillness_alert_count += 1
+            state["stillness_alert_fired"] = True
 
             if alert_event is None:
                 alert_event = AlertEvent(
@@ -1237,7 +1530,7 @@ class MonitoringEngine:
             )
             draw_text(
                 rendered,
-                f"Screen approach: {snapshot.screen_approach_delta:+0.3f} | Movement score: {snapshot.movement_score:0.2f}",
+                f"Screen ratio: {snapshot.screen_approach_delta:+0.3f} | Movement score: {snapshot.movement_score:0.2f}",
                 7,
                 (255, 255, 255),
             )
@@ -1253,7 +1546,13 @@ class MonitoringEngine:
                 9,
                 (255, 255, 255),
             )
-            draw_text(rendered, "Controls: R - recalibrate | P/Q/Esc - hide preview", 11, (220, 220, 220))
+            draw_text(
+                rendered,
+                f"Loop latency: {snapshot.loop_latency_ms:0.1f} ms | Baseline: {snapshot.baseline_generation}",
+                10,
+                (255, 255, 255),
+            )
+            draw_text(rendered, "Controls: R - recalibrate | P/Q/Esc - hide preview", 12, (220, 220, 220))
 
             if snapshot.zone == "red":
                 cv2.rectangle(
@@ -1263,7 +1562,7 @@ class MonitoringEngine:
                     (0, 0, 255),
                     4,
                 )
-                draw_text(rendered, "ALERT: Adjust posture", 12, (0, 0, 255))
+                draw_text(rendered, "ALERT: Adjust posture", 13, (0, 0, 255))
 
         return rendered
 
@@ -1287,6 +1586,70 @@ class MonitoringEngine:
                 self._on_alert(event)
             except Exception:
                 pass
+
+    def _now_iso(self) -> str:
+        return datetime.now().isoformat(timespec="milliseconds")
+
+    def _build_telemetry_row(self, snapshot: MonitoringSnapshot, state: dict) -> dict[str, object]:
+        return {
+            "wall_clock_iso": self._now_iso(),
+            "monotonic_seconds": round(time.monotonic(), 6),
+            "timestamp_ms": state.get("last_stream_timestamp_ms", 0),
+            "frame_index": state.get("frame_index", 0),
+            "pose_state": self._get_pose_state(snapshot),
+            "zone": snapshot.zone,
+            "total_score": round(snapshot.total_score, 6),
+            "movement_score": round(snapshot.movement_score, 6),
+            "dominant_issue": snapshot.dominant_issue,
+            "baseline_generation": snapshot.baseline_generation,
+            # Helper values used only for summary aggregation inside telemetry.py.
+            "posture_alert_count": snapshot.posture_alert_count,
+            "stillness_alert_count": snapshot.stillness_alert_count,
+            "reposition_count": snapshot.reposition_count,
+            "auto_recalibration_started": bool(state.get("auto_recalibration_started", False)),
+        }
+
+    def _log_frame_telemetry(self, snapshot: MonitoringSnapshot, state: dict) -> None:
+        previous_zone = state.get("last_logged_zone")
+        if previous_zone is not None and previous_zone != snapshot.zone:
+            self._log_event(
+                kind="zone_changed",
+                title="Zone changed",
+                message=f"{previous_zone} -> {snapshot.zone}",
+                state=state,
+                zone=snapshot.zone,
+                dominant_issue=snapshot.dominant_issue,
+                total_score=snapshot.total_score,
+            )
+
+        state["last_logged_zone"] = snapshot.zone
+        self._telemetry.log_frame(self._build_telemetry_row(snapshot, state))
+
+    def _log_event(
+        self,
+        kind: str,
+        title: str,
+        message: str,
+        state: dict,
+        zone: str,
+        dominant_issue: str,
+        total_score: float,
+    ) -> None:
+        self._telemetry.log_event(
+            {
+                "wall_clock_iso": self._now_iso(),
+                "monotonic_seconds": round(time.monotonic(), 6),
+                "timestamp_ms": state.get("last_stream_timestamp_ms", 0),
+                "frame_index": state.get("frame_index", 0),
+                "kind": kind,
+                "zone": zone,
+                "total_score": round(float(total_score), 6),
+                "movement_score": round(float(state.get("last_movement_score", 0.0)), 6),
+                "dominant_issue": dominant_issue,
+                "details": f"{title}: {message}" if message else title,
+                "baseline_generation": state.get("baseline_generation", 0),
+            }
+        )
 
 
 # ============================================================
@@ -1320,6 +1683,7 @@ class PostureGuardApplication:
 
         self._engine = MonitoringEngine(
             config=self._config,
+            data_dir=self._data_dir,
             on_snapshot=self._on_snapshot,
             on_alert=self._on_alert,
         )

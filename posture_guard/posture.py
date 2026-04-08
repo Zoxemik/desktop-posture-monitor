@@ -211,6 +211,15 @@ def compute_metrics(normalized_landmarks, world_landmarks, config: AppConfig) ->
     The goal is not to force one perfect pose.
     The goal is to keep the user inside a neutral calibrated range
     and detect meaningful drift or static overload.
+
+    Notes:
+    - head_forward_signed is directional. Positive values mean the head is more
+      forward relative to the shoulders, which makes later analysis easier.
+    - screen_approach_ratio is intentionally perspective-based. It uses the 2D
+      apparent shoulder span in the image as a practical proxy for moving closer
+      to the screen.
+    - head_yaw_proxy is a diagnostic metric only. It is useful in telemetry and
+      boundary-case analysis, but it does not directly affect ergonomic scoring.
     """
     if get_average_visibility(normalized_landmarks, IMPORTANT_LANDMARKS) < config.min_visibility:
         return None
@@ -235,14 +244,14 @@ def compute_metrics(normalized_landmarks, world_landmarks, config: AppConfig) ->
     torso_delta_z = shoulder_mid[2] - hip_mid[2]
 
     torso_angle_deg = math.degrees(math.atan2(abs(torso_delta_z), abs(torso_delta_y) + 1e-6))
-    head_forward_abs = abs(ear_mid[2] - shoulder_mid[2])
+    head_forward_signed = shoulder_mid[2] - ear_mid[2]
     neck_gap = abs(ear_mid[1] - shoulder_mid[1])
 
-    shoulder_width = get_distance_2d(
+    screen_approach_ratio = get_distance_2d(
         (left_shoulder_n.x, left_shoulder_n.y),
         (right_shoulder_n.x, right_shoulder_n.y),
     )
-    ear_width = get_distance_2d(
+    ear_span_ratio = get_distance_2d(
         (left_ear_n.x, left_ear_n.y),
         (right_ear_n.x, right_ear_n.y),
     )
@@ -258,12 +267,17 @@ def compute_metrics(normalized_landmarks, world_landmarks, config: AppConfig) ->
 
     head_side_shift = abs(ear_mid[0] - shoulder_mid[0])
 
+    reference_width = max(screen_approach_ratio, 1e-6)
+    normalized_ear_span = min(1.0, ear_span_ratio / reference_width)
+    head_yaw_proxy = max(0.0, 1.0 - normalized_ear_span)
+
     return {
-        "head_forward_abs": head_forward_abs,
+        "head_forward_signed": head_forward_signed,
         "torso_angle_deg": torso_angle_deg,
         "neck_gap": neck_gap,
-        "shoulder_width": shoulder_width,
-        "ear_width": ear_width,
+        "screen_approach_ratio": screen_approach_ratio,
+        "ear_span_ratio": ear_span_ratio,
+        "head_yaw_proxy": head_yaw_proxy,
         "shoulder_tilt_deg": shoulder_tilt_deg,
         "head_tilt_deg": head_tilt_deg,
         "head_side_shift": head_side_shift,
@@ -312,10 +326,10 @@ def compute_movement_score(
         return 0.0
 
     score = 0.0
-    score += abs(current_metrics["head_forward_abs"] - previous_metrics["head_forward_abs"]) / config.movement_head_forward_unit
+    score += abs(current_metrics["head_forward_signed"] - previous_metrics["head_forward_signed"]) / config.movement_head_forward_unit
     score += abs(current_metrics["torso_angle_deg"] - previous_metrics["torso_angle_deg"]) / config.movement_torso_angle_unit
     score += abs(current_metrics["neck_gap"] - previous_metrics["neck_gap"]) / config.movement_neck_gap_unit
-    score += abs(current_metrics["shoulder_width"] - previous_metrics["shoulder_width"]) / config.movement_shoulder_width_unit
+    score += abs(current_metrics["screen_approach_ratio"] - previous_metrics["screen_approach_ratio"]) / config.movement_screen_approach_unit
     score += abs(current_metrics["shoulder_tilt_deg"] - previous_metrics["shoulder_tilt_deg"]) / config.movement_shoulder_tilt_unit
     score += abs(current_metrics["head_tilt_deg"] - previous_metrics["head_tilt_deg"]) / config.movement_head_tilt_unit
     score += abs(current_metrics["head_side_shift"] - previous_metrics["head_side_shift"]) / config.movement_head_side_shift_unit
@@ -327,12 +341,12 @@ def evaluate_ergonomics(metrics: Dict[str, float], baseline: Dict[str, float], c
     """
     Evaluate posture against the calibrated baseline.
     """
-    head_forward_delta = metrics["head_forward_abs"] - baseline["head_forward_abs"]
+    head_forward_delta = metrics["head_forward_signed"] - baseline["head_forward_signed"]
     torso_delta = metrics["torso_angle_deg"] - baseline["torso_angle_deg"]
     neck_drop = baseline["neck_gap"] - metrics["neck_gap"]
     shoulder_tilt_delta = metrics["shoulder_tilt_deg"] - baseline["shoulder_tilt_deg"]
     head_tilt_delta = metrics["head_tilt_deg"] - baseline["head_tilt_deg"]
-    screen_approach_delta = metrics["shoulder_width"] - baseline["shoulder_width"]
+    screen_approach_delta = metrics["screen_approach_ratio"] - baseline["screen_approach_ratio"]
 
     issue_scores = {
         "forward_head": max(0.0, head_forward_delta / config.head_forward_delta_m) * config.weight_forward_head,
@@ -353,6 +367,7 @@ def evaluate_ergonomics(metrics: Dict[str, float], baseline: Dict[str, float], c
         zone = "red"
 
     issue_labels = {
+        "none": "",
         "forward_head": "Head too far forward",
         "torso_lean": "Torso leaning forward",
         "neck_drop": "Neck collapsing",
@@ -360,9 +375,6 @@ def evaluate_ergonomics(metrics: Dict[str, float], baseline: Dict[str, float], c
         "head_tilt": "Head tilted",
         "screen_approach": "Too close to the screen",
     }
-
-    dominant_issue_key = max(issue_scores, key=issue_scores.get)
-    dominant_issue_label = issue_labels[dominant_issue_key]
 
     issue_flags = {
         "forward_head": head_forward_delta >= config.head_forward_delta_m,
@@ -372,6 +384,12 @@ def evaluate_ergonomics(metrics: Dict[str, float], baseline: Dict[str, float], c
         "head_tilt": head_tilt_delta >= config.head_tilt_delta_deg,
         "screen_approach": screen_approach_delta >= config.screen_approach_delta,
     }
+
+    dominant_issue_key = "none"
+    dominant_issue_label = ""
+    if total_score > 0.0:
+        dominant_issue_key = max(issue_scores, key=issue_scores.get)
+        dominant_issue_label = issue_labels[dominant_issue_key]
 
     return {
         "zone": zone,
