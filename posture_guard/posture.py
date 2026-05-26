@@ -405,9 +405,12 @@ def get_distance_2d(point_a: tuple[float, float], point_b: tuple[float, float]) 
 
 def get_angle_from_horizontal(delta_y: float, delta_x: float) -> float:
     """
-    Return an absolute tilt angle in degrees relative to a horizontal line.
+    Return signed tilt angle in degrees relative to a horizontal line.
+
+    Positive and negative values represent opposite tilt directions. This keeps
+    baseline comparison meaningful for head and shoulder tilt.
     """
-    return math.degrees(math.atan2(abs(delta_y), abs(delta_x) + EPSILON))
+    return math.degrees(math.atan2(delta_y, delta_x + EPSILON))
 
 
 def _compute_torso_angle_deg(shoulder_mid: Point3D, hip_mid: Point3D) -> float:
@@ -453,12 +456,12 @@ def _compute_issue_scores(deltas: dict[str, float], config: AppConfig) -> dict[s
             config.neck_drop_delta_m,
             config.weight_neck_drop,
         ),
-        "shoulder_tilt": _weighted_positive_score(
+        "shoulder_tilt": _weighted_absolute_score(
             deltas["shoulder_tilt_delta"],
             config.shoulder_tilt_delta_deg,
             config.weight_shoulder_tilt,
         ),
-        "head_tilt": _weighted_positive_score(
+        "head_tilt": _weighted_absolute_score(
             deltas["head_tilt_delta"],
             config.head_tilt_delta_deg,
             config.weight_head_tilt,
@@ -476,8 +479,8 @@ def _compute_issue_flags(deltas: dict[str, float], config: AppConfig) -> dict[st
         "forward_head": deltas["head_delta"] >= config.head_forward_delta_m,
         "torso_lean": deltas["torso_delta"] >= config.torso_angle_delta_deg,
         "neck_drop": deltas["neck_drop"] >= config.neck_drop_delta_m,
-        "shoulder_tilt": deltas["shoulder_tilt_delta"] >= config.shoulder_tilt_delta_deg,
-        "head_tilt": deltas["head_tilt_delta"] >= config.head_tilt_delta_deg,
+        "shoulder_tilt": abs(deltas["shoulder_tilt_delta"]) >= config.shoulder_tilt_delta_deg,
+        "head_tilt": abs(deltas["head_tilt_delta"]) >= config.head_tilt_delta_deg,
         "screen_approach": deltas["screen_approach_delta"] >= config.screen_approach_delta,
     }
 
@@ -486,6 +489,9 @@ def _weighted_positive_score(delta: float, threshold: float, weight: float) -> f
     safe_threshold = max(float(threshold), EPSILON)
     return max(0.0, delta / safe_threshold) * weight
 
+def _weighted_absolute_score(delta: float, threshold: float, weight: float) -> float:
+    safe_threshold = max(float(threshold), EPSILON)
+    return abs(delta) / safe_threshold * weight
 
 def _classify_zone(total_score: float, config: AppConfig) -> str:
     if total_score < config.green_zone_max_score:
